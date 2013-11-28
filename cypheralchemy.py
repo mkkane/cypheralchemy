@@ -2,30 +2,30 @@ import urllib3
 import json
 from functools import wraps
 
-conn = urllib3.connection_from_url('http://localhost:7474')
+CONN = urllib3.connection_from_url('http://localhost:7474')
 
 # Should either Session and/or Transaction implement the context-manager
 # interface (for use with 'with')?  I'm not sure.
 
-class Session(object):
-    pass
+# class Session(object):
+#     pass
 
 
-def _assert_operable(f):
+def _assert_operable(func):
     '''Wrapper for Transaction methods to prevent action on already committed 
     or rolled-back transactions.
     '''
-    @wraps(f)
+    @wraps(func)
     def wrapper(self, *args, **kwds):
         if self._committed or self._rolled_back:
             raise TransactionClosedError(
                 'Attempted to call %s() on an already %s transaction' 
                 % (
-                    f.__name__, 
+                    func.__name__, 
                     'committed' if self._committed else 'rolled-back'
                     )
                 )
-        return f(self, *args, **kwds)
+        return func(self, *args, **kwds)
     return wrapper
 
 
@@ -51,8 +51,9 @@ class Transaction(object):
     '''
 
     BASE_PATH = '/db/data/transaction'
+    TRANSACTION_TIMED_OUT_CODE = 'Neo.ClientError.Transaction.UnknownId'
 
-    def __init__(self, connection, *args, **kwargs):
+    def __init__(self, connection):
         self._connection = connection
         self._location = self.BASE_PATH
         self._started = False
@@ -60,7 +61,9 @@ class Transaction(object):
         self._rolled_back = False
         self._executed_statements = []
         self.statements = []
-        return super().__init__(*args, **kwargs)
+        # Python 2 or 3 style supers?
+        # super().__init__(*args, **kwargs)
+        # super(Transaction).__init__(self, *args, **kwargs)
 
     @_assert_operable
     def add_statement(self, cypher, params=None):
@@ -81,9 +84,11 @@ class Transaction(object):
     def execute(self):
         '''Send the current list of cypher statements to the db and
         return the parsed response data.
+
+        If there are no pending statements, returns None.
         '''
         if not self.statements:
-            return
+            return None
 
         response = self._make_request(
             'POST', 
@@ -121,7 +126,7 @@ class Transaction(object):
         '''Rollback this transaction.'''
         # Should this raise an error or just successfully do nothing?
         if not self._started:
-            raise TransactionNotBegunError(
+            raise TransactionClosedError(
                 'Cannot rollback non-started transaction.'
                 )
 
@@ -170,11 +175,19 @@ class Transaction(object):
         # out too, the data will probably all end up in memory at some
         # stage...
         data_str = response.data.decode(response.headers['content-encoding'])
-        data = json.loads(data_str)
-        
-        # If there were errors, then neo4j have rolled-back the transaction
-        if data.get('errors'):
+        data = json.loads(data_str)        
+
+        errors = data.get('errors')
+        if errors:
+            # If there were errors, then neo4j have rolled-back the 
+            # transaction.
             self._rolled_back = True
+
+            # If the transaction didn't run at all due to a closed
+            # (timed-out) transaction, raise exception to alert the
+            # user application.
+            if errors[0].get('code') == self.TRANSACTION_TIMED_OUT_CODE:
+                raise TransactionClosedError(errors[0].get('message'))
 
         return data
 
@@ -186,12 +199,6 @@ class CypherAlchemyError(Exception):
 class TransactionClosedError(CypherAlchemyError):
     '''An attempt was made to act on an already committed or
     rolled-back transaction.
-    '''
-    pass
-
-class TransactionNotBegunError(CypherAlchemyError):
-    '''An attempt was made to rollback a transaction that hasn't been
-    started.
     '''
     pass
 
