@@ -2,13 +2,93 @@ import urllib3
 import json
 from functools import wraps
 
-CONN = urllib3.connection_from_url('http://localhost:7474')
+DEFAULT_NEO4J_URL = 'http://localhost:7474'
 
-# Should either Session and/or Transaction implement the context-manager
-# interface (for use with 'with')?  I'm not sure.
+class Engine(object):
+    '''The Engine class is responsible for generating Transactions
+    that the Session can use to do it's work.
+    '''
+    def __init__(self, url=DEFAULT_NEO4J_URL):
+        self._connection = self._generate_connection(url)
 
-# class Session(object):
-#     pass
+    def create_transaction(self):
+        '''Create a new Transaction with our current urllib3 connection.'''
+        return Transaction(self._connection)
+
+    def _generate_connection(self, url):
+        '''Generate a urllib3 connection that will be passed to the
+        Transaction class when creating new Transactions.
+        '''
+        return urllib3.connection_from_url(
+            'http://localhost:7474', 
+            headers={
+                'Accept': 'application/json',
+                'X-Stream': 'true'
+                }
+            )
+
+
+class Session(object):
+    def __init__(self, engine):
+        self._engine = engine
+
+    @property
+    def transaction(self):
+        '''Return the current transaction.
+
+        This will generate a new transaction when needed.
+        '''
+        if (
+            not getattr(self, '_transaction', False) 
+            or not self._transaction.is_operable()
+            ):
+            self._transaction = self._engine.create_transaction()
+        return self._transaction
+
+    def query(self, model_class=None):
+        return Query(self, model_class)
+
+    def add(self, model):
+        pass
+
+    def delete(self, model):
+        pass
+
+    def flush(self):
+        pass
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+
+class Query(object):
+    def __init__(self, session, model_class=None):
+        self._session = session
+        self._model_class = model_class
+
+    def cypher(self, cypher_string, params={}, raw=False):
+        # Just testing.  Obviously shouldn't be grabbing and commiting
+        # the sessions transaction from here!
+        t = self._session.transaction
+        t.add_statement(cypher_string, params)
+        response = t.commit()
+        if raw:
+            return response
+
+        errors = response.get('errors')
+        if errors:
+            # If neo4j reported a syntax error, raise an appropriate exception 
+            if errors[0].get('code') == CYPHER_SYNTAX_ERROR_CODE:
+                raise CypherSyntaxError(errors[0].get('message'))
+
+            # If we don't know about this neo4j error, raise a general esception
+            raise RequestError('{code}: {message}'.format(**errors[0]))
+
+        return [r['row'] for r in response['results'][0]['data']]
 
 
 def _assert_operable(func):
@@ -17,7 +97,7 @@ def _assert_operable(func):
     '''
     @wraps(func)
     def wrapper(self, *args, **kwds):
-        if self._committed or self._rolled_back:
+        if not self.is_operable():
             raise TransactionClosedError(
                 'Attempted to call %s() on an already %s transaction' 
                 % (
@@ -51,9 +131,9 @@ class Transaction(object):
     '''
 
     BASE_PATH = '/db/data/transaction'
-    TRANSACTION_TIMED_OUT_CODE = 'Neo.ClientError.Transaction.UnknownId'
 
     def __init__(self, connection):
+        '''Initialise a transaction with a urllib3 connection object.'''
         self._connection = connection
         self._location = self.BASE_PATH
         self._started = False
@@ -61,9 +141,17 @@ class Transaction(object):
         self._rolled_back = False
         self._executed_statements = []
         self.statements = []
-        # Python 2 or 3 style supers?
-        # super().__init__(*args, **kwargs)
-        # super(Transaction).__init__(self, *args, **kwargs)
+
+    def is_operable(self):
+        '''Can this transaction be operated on.
+
+        Note: this is a best guess, the Transaction may have timed-out
+        and been rolled back by the server without us being aware till
+        we try to operate on it.  (TODO, store the 'expires' data sent
+        back by the server so we can more accurately know if this
+        transaction is still open.)
+        '''
+        return not (self._committed or self._rolled_back)
 
     @_assert_operable
     def add_statement(self, cypher, params=None):
@@ -146,6 +234,9 @@ class Transaction(object):
         self.statements = []
 
     def _get_prepared_statements(self):
+        '''Return all current statements in a format usable as the
+        body of a json request to the neo4j transaction endpoint.
+        '''
         return {'statements':self.statements}
 
     def _make_request(self, method, path, data=None):
@@ -186,7 +277,7 @@ class Transaction(object):
             # If the transaction didn't run at all due to a closed
             # (timed-out) transaction, raise exception to alert the
             # user application.
-            if errors[0].get('code') == self.TRANSACTION_TIMED_OUT_CODE:
+            if errors[0].get('code') == TRANSACTION_TIMED_OUT_CODE:
                 raise TransactionClosedError(errors[0].get('message'))
 
         return data
@@ -196,9 +287,19 @@ class CypherAlchemyError(Exception):
     '''Base CypherAlchemy Exception.'''
     pass
 
-class TransactionClosedError(CypherAlchemyError):
+class RequestError(CypherAlchemyError):
+    '''There was some problem with an attempted request to neo4j.'''
+    pass
+
+class TransactionClosedError(RequestError):
     '''An attempt was made to act on an already committed or
     rolled-back transaction.
     '''
     pass
 
+class CypherSyntaxError(RequestError):
+    '''Neo4j reported a syntax error with the request.'''
+    pass
+
+TRANSACTION_TIMED_OUT_CODE = 'Neo.ClientError.Transaction.UnknownId'
+CYPHER_SYNTAX_ERROR_CODE = 'Neo.ClientError.Statement.InvalidSyntax'
